@@ -66,6 +66,7 @@ def Gibbs_sampling(X, r=50, M=1000, burn_in = 1500):
     # B_sample = torch.ones(P, r, device = device, dtype = torch.float64)
     # sigma2_sample = torch.ones(P, device = device, dtype = torch.float64)
     B_sample, sigma2_sample = initialization(X, N, r)
+    sigma2_sample = sigma2_sample.repeat(P)
     delta_sample = torch.ones(r, device = device, dtype = torch.float64)
     lam_sample = torch.cumprod(delta_sample, dim=0)
 
