@@ -1,24 +1,18 @@
 import torch
 from tqdm import tqdm
 from torch.distributions.gamma import Gamma
+from torch.linalg import solve
+from torch import einsum, eye, randn_like, ones_like, stack,svd
 
-
-# define product function with one element out
-
-def prod_oneout(delta, t, k):
+def initialization(X, n, r):
     
-    """
-    t: order of the out element
-    k: product of the first k elements
-    """
+    U, S, _ = svd(X.T / (n-1)**0.5)
 
-    prod = 1
-    
-    for i in range(k):
-        if i != t-1:
-            prod = prod * delta[i]
-    
-    return prod.item()
+    sigma2_estimator = S[r:].square().sum() / (n-r)
+
+    mu = U[:, 0:r] * (S[0:r].square() - sigma2_estimator).sqrt()
+
+    return mu, sigma2_estimator
 
 def sample_eta(X, B, sigma ,device):
     
@@ -32,53 +26,32 @@ def sample_eta(X, B, sigma ,device):
     
     return eta.T
 
-def sample_tau(B, lam, v):
-    
-    tau = Gamma(0.5 * (v + 1), 0.5 * (v + B.pow(2) * lam)).sample()
-
-    return tau
-
 def sample_delta(B, delta, tau, a1, a2):
 
-    P,r = B.size()
-    delta_samplein = delta.clone()
-
-    # update delta1
-    prod_out1 = torch.ones(r-1, device = B.device, dtype = torch.float64)
+    p,r = B.shape
     
-    for k in range(len(prod_out1)):
-        prod_out1[k] = prod_oneout(delta_samplein, 1, k+2)
+    ink = (B.square() * tau).sum(0)
 
-    B_cap = B[:, 1:].clone()
-    tau_cap = tau[:, 1:].clone()
-    
-    delta1 = Gamma(a1 + 0.5 * P * r, 1 + 0.5 * (B_cap.pow(2) * tau_cap * prod_out1).sum()).sample()
-    delta_samplein[0] = delta1
-
-    #update other delta
-    for t in range(2, r+1):
-        prod_out2 = torch.ones(r-t, device = B.device, dtype = torch.float64)
-
-        for k in range(len(prod_out2)):
-            prod_out2[k] = prod_oneout(delta_samplein, t, k+t+1)
-
-        B_cap2 = B[:, t:].clone()
-        tau_cap2 = tau[:, t:].clone()
-
-        delta2 = Gamma(a1 + 0.5 * P * (r-t+1), 1 + 0.5 * (B_cap2.pow(2) * tau_cap2 * prod_out2).sum()).sample()
-        delta_samplein[t-1] = delta2
-
-    return delta_samplein
+    for j in range(0, r):
+        
+        lam = torch.cumprod(delta, dim = 0)
+        
+        if j == 0:
+            delta[j] = Gamma(a1 + 0.5 * p * (r - j),  0.5 * ((lam[j:] / delta[j]) * ink [j:]).sum() + 1).sample()
+        else:
+            delta[j] = Gamma(a2 + 0.5 * p * (r - j),  0.5 * ((lam[j:] / delta[j]) * ink [j:]).sum() + 1).sample()
+                
+    return delta
 
 def Gibbs_sampling(X, r=50, M=1000, burn_in = 1500):
 
     ## set hyperparameters
     
-    a_sigma = 0.5
-    b_sigma = 0.5
-    v = 2
-    a1 = 2
-    a2 = 2
+    a_sigma = 1
+    b_sigma = 1
+    v = 3
+    a1 = 3
+    a2 = 3
 
     N, P = X.shape
     
@@ -90,8 +63,9 @@ def Gibbs_sampling(X, r=50, M=1000, burn_in = 1500):
 
     ## initialization
 
-    B_sample = torch.ones(P, r, device = device, dtype = torch.float64)
-    sigma2_sample = torch.ones(P, device = device, dtype = torch.float64)
+    # B_sample = torch.ones(P, r, device = device, dtype = torch.float64)
+    # sigma2_sample = torch.ones(P, device = device, dtype = torch.float64)
+    B_sample, sigma2_sample = initialization(X, N, r)
     delta_sample = torch.ones(r, device = device, dtype = torch.float64)
     lam_sample = torch.cumprod(delta_sample, dim=0)
 
@@ -101,11 +75,11 @@ def Gibbs_sampling(X, r=50, M=1000, burn_in = 1500):
         eta_sample = sample_eta(X, B_sample, sigma2_sample.sqrt(), device)
 
         # sample sigma2
-        sigma2_sample = (b_sigma + 0.5 * ((X - eta_sample @ B_sample.T).pow(2).sum(0))) / Gamma(a_sigma + 0.5 * N, torch.ones(P, device = device, dtype = torch.float64)).sample()
+        sigma2_sample = (b_sigma + 0.5 * ((X - eta_sample @ B_sample.T).pow(2).sum(0))) / Gamma(a_sigma + 0.5 * N, ones_like(sigma2_sample)).sample()
 
         # sample shrinkage parameter
         # sample tau
-        tau_sample = sample_tau(B_sample, lam_sample, v)
+        tau_sample = Gamma(0.5 * (v + 1), 0.5 * (v + B_sample.square() * lam_sample)).sample()
 
         #sample lam
         delta_sample = sample_delta(B_sample, delta_sample, tau_sample, a1, a2)
@@ -114,11 +88,11 @@ def Gibbs_sampling(X, r=50, M=1000, burn_in = 1500):
         D = 1 / (tau_sample * lam_sample).sqrt()
 
         # sample B
-        C = (D.unsqueeze(-1) * eta_sample.T.unsqueeze(0)) / sigma2_sample.sqrt().unsqueeze(-1).unsqueeze(-1)
+        C = (D.view(P,r,1) * eta_sample.T.view(1,r,N))/ sigma2_sample.sqrt().view(P,1,1)
 
-        b =  D * (eta_sample.T @ X / sigma2_sample).T + torch.einsum('bij,bj->bi', C, torch.randn(P, N, device= device, dtype= torch.float64)) + torch.randn(P, r, device= device, dtype = torch.float64)
+        b =  D * (eta_sample.T @ X / sigma2_sample).T + torch.einsum('bij,bj->bi', C, randn_like(X.T)) + randn_like(B_sample)
 
-        B_sample = D * torch.linalg.solve(torch.einsum('bij,bjk->bik', C, C.transpose(1,2)) + torch.eye(r, device= device, dtype= torch.float64).unsqueeze(0).repeat(P, 1, 1), b)
+        B_sample = D * solve(einsum('bij,bjk->bik', C, C.transpose(1,2)) + eye(r, device= device, dtype= torch.float64).view(1, r, r), b)
 
         if (i + 1) > burn_in:
 
@@ -126,4 +100,4 @@ def Gibbs_sampling(X, r=50, M=1000, burn_in = 1500):
             sigma2_samples.append(sigma2_sample)
 
         
-    return torch.stack(B_samples).squeeze().to('cpu'), torch.stack(sigma2_samples).squeeze().to('cpu')
+    return stack(B_samples).squeeze().to('cpu'), stack(sigma2_samples).squeeze().to('cpu')
